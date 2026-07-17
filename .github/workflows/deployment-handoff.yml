@@ -1,0 +1,71 @@
+name: Deployment handoff and rollback
+
+on:
+  push:
+    branches: ["deploy/**"]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: frontend-production-handoff
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test -- --runInBand
+      - run: npm run test:a11y
+      - run: npm run build
+      - name: Publish protected deployment PR
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          release=$(jq -r .commit public/release.json)
+          pr_url=$(gh pr create --base master --head "$GITHUB_REF_NAME" --title "Deploy frontend ${release:0:12}" --body "Validated automated deployment of monorepo release $release.")
+          pr_number="${pr_url##*/}"
+          gh pr merge "$pr_number" --squash --delete-branch
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
+      - name: Verify Hostinger deployment and roll back on failure
+        shell: bash
+        env:
+          RELEASE: ${{ steps.publish.outputs.release }}
+        run: |
+          set -uo pipefail
+          for attempt in {1..90}; do
+            live=$(curl -fsS --max-time 20 https://fieldserviceit.com/release.json | jq -r .commit 2>/dev/null || true)
+            footer=$(curl -fsS --max-time 20 https://fieldserviceit.com/ 2>/dev/null || true)
+            if [ "$live" = "$RELEASE" ] && grep -q '/privacy' <<< "$footer" && grep -Eq '©|&copy;' <<< "$footer"; then
+              echo "Frontend release $RELEASE is live with the global footer."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Frontend release $RELEASE did not become healthy; creating rollback." >&2
+          git fetch origin master
+          failed_commit=$(git rev-parse origin/master)
+          rollback_branch="rollback/frontend-${GITHUB_RUN_ID}"
+          git config user.name "FieldServiceIT Deploy Bot"
+          git config user.email "deploy-bot@fieldserviceit.com"
+          git checkout -b "$rollback_branch" origin/master
+          git revert --no-edit "$failed_commit"
+          git push --set-upstream origin "$rollback_branch"
+          rollback_url=$(gh pr create --base master --head "$rollback_branch" --title "Rollback failed frontend release ${RELEASE:0:12}" --body "Automatic rollback because Hostinger did not serve release $RELEASE with its global footer within 15 minutes.")
+          gh pr merge "${rollback_url##*/}" --squash --delete-branch
+          exit 1
